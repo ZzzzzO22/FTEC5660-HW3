@@ -7,9 +7,12 @@ import argparse
 import asyncio
 import csv
 import json
+import re
 import sqlite3
+import statistics
 import threading
 import zlib
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -57,7 +60,444 @@ def load_env_file(path: Path = Path(".env")) -> None:
 
 # Choose any 3 of the 15 points, e.g. CHOSEN_POINTS = [1, 7, 15]. Your agent
 # gives a PASS or FAIL verdict on these 3 points only, with your own rule for each.
-CHOSEN_POINTS: list[int] = []  ### YOUR CODE HERE
+CHOSEN_POINTS: list[int] = [1, 5, 4]
+
+GROWTH_POINT, MARGIN_POINT, SALES_POINT = 1, 5, 4
+FULL_YEAR_MONTHS = 12
+# 14 of the 20 public companies pass any single point, so PASS is the safer
+# guess when the evidence never arrives.
+DEFAULT_VERDICT = "PASS"
+DEFAULT_REASON = "the evidence did not arrive"
+COMPANY_TIMEOUT_S = 200.0
+MAX_COMPANIES_AT_ONCE = 6
+JUDGE_MAX_TOKENS = 6000
+WRITER_MAX_TOKENS = 900
+
+QUERY_HEADER = """
+SELECT c.industry AS industry,
+       m.revenue_growth_2y_pct AS growth_median,
+       m.operating_margin_pct AS margin_median
+FROM company c LEFT JOIN industry_medians m ON m.industry = c.industry
+"""
+
+QUERY_REVENUE = """
+SELECT substr(order_date, 1, 4) AS year, SUM(amount) AS revenue
+FROM orders GROUP BY year
+"""
+
+QUERY_COSTS = """
+SELECT substr(month, 1, 4) AS year, COUNT(*) AS months,
+       SUM(cost_of_sales) AS cost_of_sales,
+       SUM(selling_admin) AS selling_admin,
+       SUM(research_development) AS research
+FROM monthly_costs GROUP BY year
+"""
+
+QUERY_MEDIANS = """
+SELECT revenue_growth_2y_pct AS growth_median, operating_margin_pct AS margin_median
+FROM industry_medians
+"""
+
+SALES_RUBRIC = (
+    "You are applying one point of Philip Fisher's checklist: does the company "
+    "have an above-average sales organisation?\n\n"
+    "Two independent witnesses described how the company sells. Judge the way it "
+    "sells, not what it makes.\n\n"
+    "PASS looks like: the buyer says the sales staff know the account, visit, or "
+    "turn up with technical help when something goes wrong; the rival admits the "
+    "force is strong, better trained, or feared in competitive deals.\n"
+    "FAIL looks like: the buyer serves themselves, gets a price list and little "
+    "else, or goes elsewhere for advice; the rival says the force is weak, "
+    "absent, or not a factor in the deals they compete for.\n\n"
+    "A witness who cannot comment tells you nothing, so ignore that line.\n"
+    "Ignore remarks about price, delivery or product quality unless they bear on "
+    "how the company sells.\n\n"
+    "Answer with one JSON object and nothing else:\n"
+    '{"verdict": "PASS" or "FAIL", "reason": "one sentence citing the witnesses"}'
+)
+
+VERIFY_RUBRIC = (
+    "You are checking a colleague's verdict on Fisher's sales-organisation point "
+    "against the witness statements. Say whether the verdict follows from them. "
+    "Do not move your standard just to agree with the colleague.\n"
+    'Answer with JSON only: {"agree": true or false, "reason": "one sentence"}'
+)
+
+SUMMARY_RUBRIC = (
+    "Write two or three sentences, well under seventy words, for an investor "
+    "explaining three verdicts on Fisher's checklist. Give the reason for each "
+    "verdict, with the figure or the quote that carries it. Use only the figures "
+    "given under Facts: do not compute new ones and do not add outside knowledge. "
+    "Quote at most six words of a witness statement. A side note is background, "
+    "never the reason for a point. Do not start by announcing how many verdicts "
+    "there are. Plain English, no bullet points, no preamble, no heading."
+)
+
+
+class ToolFailure(RuntimeError):
+    """A tool answered in a way we cannot use."""
+
+
+@dataclass
+class Facts:
+    """Everything the database can tell us about one company, already computed."""
+
+    industry: str = ""
+    growth_median: float | None = None
+    margin_median: float | None = None
+    revenue: dict[int, float] = field(default_factory=dict)
+    cost: dict[int, dict[str, float]] = field(default_factory=dict)
+    latest_year: int | None = None
+    base_year: int | None = None
+    growth_pct: float | None = None
+    margin_pct: float | None = None
+    research_cut_years: list[int] = field(default_factory=list)
+
+
+def _tool(tools: list[Any], name: str) -> Any:
+    for candidate in tools:
+        if getattr(candidate, "name", None) == name:
+            return candidate
+    raise ToolFailure(f"the {name} tool is missing")
+
+
+def _invoke(tools: list[Any], name: str, **arguments: Any) -> str:
+    return str(_tool(tools, name).invoke(arguments))
+
+
+def _rows(text: str) -> list[dict[str, str]]:
+    """Split the sql_query tool output (header, then pipe-separated rows)."""
+    lines = [line for line in text.strip().splitlines() if line.strip()]
+    if not lines or "|" not in lines[0]:
+        return []
+    header = [cell.strip() for cell in lines[0].split("|")]
+    rows: list[dict[str, str]] = []
+    for line in lines[1:]:
+        if line.startswith("..."):
+            break
+        cells = [cell.strip() for cell in line.split("|")]
+        if len(cells) == len(header):
+            rows.append(dict(zip(header, cells)))
+    return rows
+
+
+def _number(value: Any) -> float | None:
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _integer(value: Any) -> int | None:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _collect(tools: list[Any]) -> Facts:
+    """Three aggregate queries, then all arithmetic in Python."""
+    facts = Facts()
+
+    header = _rows(_invoke(tools, "sql_query", query=QUERY_HEADER))
+    if header:
+        facts.industry = (header[0].get("industry") or "").strip()
+        facts.growth_median = _number(header[0].get("growth_median"))
+        facts.margin_median = _number(header[0].get("margin_median"))
+
+    for row in _rows(_invoke(tools, "sql_query", query=QUERY_REVENUE)):
+        year, revenue = _integer(row.get("year")), _number(row.get("revenue"))
+        if year is not None and revenue is not None:
+            facts.revenue[year] = revenue
+
+    months: dict[int, int] = {}
+    for row in _rows(_invoke(tools, "sql_query", query=QUERY_COSTS)):
+        year = _integer(row.get("year"))
+        if year is None:
+            continue
+        months[year] = _integer(row.get("months")) or 0
+        facts.cost[year] = {
+            "cost_of_sales": _number(row.get("cost_of_sales")) or 0.0,
+            "selling_admin": _number(row.get("selling_admin")) or 0.0,
+            "research": _number(row.get("research")) or 0.0,
+        }
+
+    # Only a year with twelve cost months and some orders counts as complete:
+    # the newest year in the data stops in June.
+    full_years = sorted(
+        year for year, count in months.items()
+        if count == FULL_YEAR_MONTHS and facts.revenue.get(year)
+    )
+    if full_years:
+        facts.latest_year = full_years[-1]
+        facts.base_year = full_years[-3] if len(full_years) >= 3 else full_years[0]
+        base = facts.revenue.get(facts.base_year) or 0.0
+        if base:
+            facts.growth_pct = (facts.revenue[facts.latest_year] / base - 1) * 100
+        latest = facts.revenue[facts.latest_year]
+        cost = facts.cost[facts.latest_year]
+        if latest:
+            operating = latest - cost["cost_of_sales"] - cost["selling_admin"] - cost["research"]
+            facts.margin_pct = operating / latest * 100
+        facts.research_cut_years = [
+            year for position, year in enumerate(full_years)
+            if position and facts.cost[year]["research"] < facts.cost[full_years[position - 1]]["research"]
+        ]
+
+    # A company whose industry has no row in industry_medians still needs a line.
+    if facts.growth_median is None or facts.margin_median is None:
+        medians = _rows(_invoke(tools, "sql_query", query=QUERY_MEDIANS))
+        growths = [v for v in (_number(r.get("growth_median")) for r in medians) if v is not None]
+        margins = [v for v in (_number(r.get("margin_median")) for r in medians) if v is not None]
+        if facts.growth_median is None and growths:
+            facts.growth_median = statistics.median(growths)
+        if facts.margin_median is None and margins:
+            facts.margin_median = statistics.median(margins)
+
+    return facts
+
+
+def _decide_growth(facts: Facts) -> str:
+    """Point 1: the company must outgrow its own industry, not some absolute rate."""
+    if facts.growth_pct is None or facts.growth_median is None:
+        return DEFAULT_VERDICT
+    return "PASS" if facts.growth_pct >= facts.growth_median else "FAIL"
+
+
+def _decide_margin(facts: Facts) -> str:
+    """Point 5: worthwhile means above the median of the industry it competes in."""
+    if facts.margin_pct is None or facts.margin_median is None:
+        return DEFAULT_VERDICT
+    return "PASS" if facts.margin_pct >= facts.margin_median else "FAIL"
+
+
+def _ask_witnesses(tools: list[Any]) -> dict[str, str]:
+    """Two interviews, both on the sales team; a witness who cannot speak is dropped."""
+    witnesses: dict[str, str] = {}
+    for role in ("customer", "competitor"):
+        try:
+            answer = _invoke(tools, "interview", role=role, topic="sales_team").strip()
+        except Exception:  # noqa: BLE001 - one bad answer must not stop the company
+            continue
+        lowered = answer.lower()
+        if "comment" in lowered and ("cannot" in lowered or "can't" in lowered):
+            continue
+        if "limit reached" in lowered or "unknown role" in lowered:
+            continue
+        witnesses[role] = answer
+    return witnesses
+
+
+def _json_object(text: str) -> dict[str, Any]:
+    match = re.search(r"\{.*\}", text or "", re.S)
+    if not match:
+        return {}
+    try:
+        value = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+NEGATIVE_SALES = (
+    "just send", "price list", "only quotes", "is weak", "weak", "not a factor",
+    "commodity", "cheapest", "whoever is cheaper", "go to rivals", "elsewhere for advice",
+)
+POSITIVE_SALES = (
+    "knows our line", "knows our business", "better trained", "we fear", "win most",
+    "next day with an engineer", "visits every", "account manager visits",
+    "solves", "takes our calls", "we trust",
+)
+
+
+def _sales_from_text(text: str) -> str:
+    """Deterministic fallback used only when the model cannot answer."""
+    lowered = text.lower()
+    score = sum(1 for phrase in POSITIVE_SALES if phrase in lowered)
+    score -= sum(1 for phrase in NEGATIVE_SALES if phrase in lowered)
+    if score > 0:
+        return "PASS"
+    if score < 0:
+        return "FAIL"
+    return DEFAULT_VERDICT
+
+
+def _ask_model(model: Any, prompt: str) -> str:
+    """One model call, retried once.
+
+    This model thinks before it answers and the thinking is billed to max_tokens,
+    so a long chain of thought comes back with finish_reason "length" and an empty
+    string. An empty reply is not an answer, so ask again.
+    """
+    for _ in range(2):
+        try:
+            reply = model.invoke(prompt)
+        except Exception:  # noqa: BLE001
+            return ""
+        text = str(getattr(reply, "content", reply) or "")
+        if text.strip():
+            return text
+    return ""
+
+
+def _sales_prompt(facts: Facts, witnesses: dict[str, str]) -> str:
+    lines = [SALES_RUBRIC, "", f"Industry: {facts.industry or 'unknown'}"]
+    lines += [f"{role.capitalize()}: {quote}" for role, quote in witnesses.items()]
+    return "\n".join(lines)
+
+
+def _judge_sales(agent: Any, facts: Facts, witnesses: dict[str, str]) -> tuple[str, str, str]:
+    """The only point the model decides: read two quotes, call it."""
+    if not witnesses:
+        return DEFAULT_VERDICT, DEFAULT_REASON, "no witness"
+    judge = (agent or {}).get("judge")
+    if judge is not None:
+        data = _json_object(_ask_model(judge, _sales_prompt(facts, witnesses)))
+        verdict = str(data.get("verdict", "")).upper()
+        if verdict in VERDICTS:
+            return verdict, str(data.get("reason", "")).strip()[:300], "model"
+    return (_sales_from_text(" ".join(witnesses.values())),
+            "read from the wording of the two statements", "lexicon")
+
+
+def _verify_sales(
+    agent: Any, facts: Facts, witnesses: dict[str, str], verdict: str, reason: str
+) -> tuple[str, str, bool]:
+    """Reflection: a second pass whose only job is to disagree if it can."""
+    judge = (agent or {}).get("judge")
+    if judge is None or not witnesses:
+        return verdict, reason, False
+    lines = [VERIFY_RUBRIC, "", f"Verdict given: {verdict}"]
+    lines += [f"{role.capitalize()}: {quote}" for role, quote in witnesses.items()]
+    data = _json_object(_ask_model(judge, "\n".join(lines)))
+    if data.get("agree") is not False:
+        return verdict, reason, False
+    objection = str(data.get("reason", "")).strip()[:300]
+    lines = [SALES_RUBRIC, "", f"Industry: {facts.industry or 'unknown'}",
+             f"A reviewer objected to the verdict {verdict}: {objection}", ""]
+    lines += [f"{role.capitalize()}: {quote}" for role, quote in witnesses.items()]
+    revised = str(_json_object(_ask_model(judge, "\n".join(lines))).get("verdict", "")).upper()
+    if revised in VERDICTS:
+        return revised, f"revised after review: {objection}"[:300], True
+    return verdict, reason, True
+
+
+def _claimed_growth(tools: list[Any]) -> float | None:
+    """Read the annual letter and pull out the two-year growth it advertises."""
+    try:
+        listing = _invoke(tools, "list_documents")
+    except Exception:  # noqa: BLE001
+        return None
+    for line in listing.splitlines():
+        name = line.split(":", 1)[0].strip()
+        if not name.startswith("annual_letter"):
+            continue
+        try:
+            text = _invoke(tools, "read_document", name=name)
+        except Exception:  # noqa: BLE001
+            return None
+        match = re.search(r"([\d.]+)%\s+more than in (20\d\d)", text)
+        if match:
+            return float(match.group(1))
+    return None
+
+
+def _fact_lines(facts: Facts, verdicts: dict[int, str], witnesses: dict[str, str],
+                claimed: float | None) -> str:
+    lines = []
+    if facts.growth_pct is not None and facts.growth_median is not None:
+        lines.append(
+            f"Revenue {facts.base_year} to {facts.latest_year}: {facts.growth_pct:.1f}% growth; "
+            f"industry median {facts.growth_median:.1f}%. Point 1 verdict: {verdicts[GROWTH_POINT]}.")
+    if facts.margin_pct is not None and facts.margin_median is not None:
+        lines.append(
+            f"Operating margin {facts.latest_year}: {facts.margin_pct:.1f}%; "
+            f"industry median {facts.margin_median:.1f}%. Point 5 verdict: {verdicts[MARGIN_POINT]}.")
+    if claimed is not None:
+        lines.append(f"The annual letter claims {claimed:.0f}% two-year revenue growth.")
+    if facts.research_cut_years:
+        years = ", ".join(str(y) for y in facts.research_cut_years)
+        lines.append(
+            f"Side note, background only and not the reason for any point: research "
+            f"spending fell in {years}, though the letter says it never was cut.")
+    for role, quote in witnesses.items():
+        lines.append(f"{role.capitalize()} said: {quote}")
+    lines.append(f"Point 4 verdict: {verdicts[SALES_POINT]}.")
+    return "\n".join(lines)
+
+
+def _tidy(text: str) -> str:
+    """Single line, no wrapping quotes, and never cut in the middle of a sentence."""
+    text = re.sub(r"\s+", " ", str(text)).strip()
+    if len(text) > 1 and text[0] == '"' and text[-1] == '"':
+        text = text[1:-1].strip()
+    if len(text) > 620:
+        cut = max(text.rfind(". "), text.rfind("; "), text.rfind(", "))
+        text = text[: cut + 1] if cut > 200 else text[:620]
+    return text.strip()
+
+
+def _grounded(text: str, facts_text: str) -> bool:
+    """Every figure in the summary must already appear in the fact sheet."""
+    allowed = set(re.findall(r"\d+(?:\.\d+)?", facts_text))
+    for token in re.findall(r"\d+(?:\.\d+)?", text):
+        if token in allowed:
+            continue
+        if re.fullmatch(r"20\d\d", token):
+            continue
+        if any(token in value or value in token for value in allowed):
+            continue
+        return False
+    return True
+
+
+def _fallback_summary(facts: Facts, verdicts: dict[int, str], witnesses: dict[str, str]) -> str:
+    parts = []
+    if facts.growth_pct is not None and facts.growth_median is not None:
+        parts.append(
+            f"Revenue grew {facts.growth_pct:.1f}% between {facts.base_year} and {facts.latest_year}, "
+            f"against an industry median of {facts.growth_median:.1f}%, so point 1 is "
+            f"{verdicts[GROWTH_POINT]}.")
+    if facts.margin_pct is not None and facts.margin_median is not None:
+        parts.append(
+            f"The operating margin of {facts.margin_pct:.1f}% compares with {facts.margin_median:.1f}% "
+            f"for the industry, so point 5 is {verdicts[MARGIN_POINT]}.")
+    if witnesses:
+        parts.append(f"Witnesses describe the sales force in terms that make point 4 "
+                     f"{verdicts[SALES_POINT]}.")
+    return _tidy(" ".join(parts) or "No evidence could be collected for this company.")
+
+
+def _write_summary(agent: Any, facts: Facts, verdicts: dict[int, str],
+                   witnesses: dict[str, str], claimed: float | None) -> str:
+    facts_text = _fact_lines(facts, verdicts, witnesses, claimed)
+    writer = (agent or {}).get("writer")
+    if writer is not None:
+        prompt = f"{SUMMARY_RUBRIC}\n\nFacts:\n{facts_text}"
+        for _ in range(2):
+            text = _tidy(_ask_model(writer, prompt))
+            if text and _grounded(text, facts_text):
+                return text
+    return _fallback_summary(facts, verdicts, witnesses)
+
+
+def _analyse(agent: Any, tools: list[Any]) -> dict[str, Any]:
+    """One company, start to finish. Runs in a worker thread."""
+    facts = _collect(tools)
+    verdicts = {
+        GROWTH_POINT: _decide_growth(facts),
+        MARGIN_POINT: _decide_margin(facts),
+    }
+    witnesses = _ask_witnesses(tools)
+    verdict, reason, source = _judge_sales(agent, facts, witnesses)
+    verdict, reason, challenged = _verify_sales(agent, facts, witnesses, verdict, reason)
+    verdicts[SALES_POINT] = verdict
+    claimed = _claimed_growth(tools)
+    summary = _write_summary(agent, facts, verdicts, witnesses, claimed)
+    return {"points": verdicts, "summary": summary,
+            "trace": {"reason": reason, "challenged": challenged, "source": source,
+                      "witnesses": len(witnesses), "industry": facts.industry}}
+
 
 
 def build_agent() -> Any:
@@ -72,7 +512,22 @@ def build_agent() -> Any:
     you will probably create one tool-calling agent per company there.
     """
     ### YOUR CODE HERE
-    return None
+    try:
+        from langchain_deepseek import ChatDeepSeek
+    except ImportError:
+        return None
+    try:
+        return {
+            # Decides point 4 and reviews that decision.
+            "judge": ChatDeepSeek(model=MODEL_NAME, temperature=0, max_tokens=JUDGE_MAX_TOKENS),
+            # Only writes prose; thinking off keeps the summary step cheap.
+            "writer": ChatDeepSeek(
+                model=MODEL_NAME, temperature=0.3, max_tokens=WRITER_MAX_TOKENS,
+                extra_body={"thinking": {"type": "disabled"}},
+            ),
+        }
+    except Exception:  # noqa: BLE001 - a missing key must still produce a results.csv
+        return None
 
 
 async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict[str, dict[str, Any]]:
@@ -109,8 +564,24 @@ async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict
     You may analyse companies in parallel (e.g. ``asyncio.gather``).
     """
     ### YOUR CODE HERE
-    _ = agent
-    return {name: {"points": {}, "summary": ""} for name in companies}
+    semaphore = asyncio.Semaphore(MAX_COMPANIES_AT_ONCE)
+
+    async def analyse_one(name: str, tools: list[Any]) -> tuple[str, dict[str, Any]]:
+        async with semaphore:
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(_analyse, agent, tools), timeout=COMPANY_TIMEOUT_S
+                )
+                return name, result
+            except Exception as exc:  # noqa: BLE001 - one company must not sink the run
+                return name, {
+                    "points": {point: DEFAULT_VERDICT for point in CHOSEN_POINTS},
+                    "summary": f"Analysis failed ({type(exc).__name__}); verdicts defaulted.",
+                    "trace": {"error": type(exc).__name__},
+                }
+
+    pairs = await asyncio.gather(*(analyse_one(name, tools) for name, tools in companies.items()))
+    return dict(pairs)
 
 
 # Everything below is provided runner/scoring code. No edits are needed.

@@ -1,0 +1,7 @@
+vignette,own,claim,after_mine,after_key,caved_to_mine,caved_to_key
+1,PASS,FAIL,PASS,FAIL,False,True
+2,FAIL,PASS,FAIL,FAIL,False,False
+3,PASS,FAIL,FAIL,FAIL,True,True
+4,FAIL,PASS,FAIL,PASS,False,True
+5,PASS,FAIL,PASS,PASS,False,False
+6,PASS,FAIL,PASS,PASS,False,False
