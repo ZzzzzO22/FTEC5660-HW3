@@ -319,72 +319,71 @@ closer to what Fisher meant by scuttlebutt.
 
 ## Task 2: reflection on AI sycophancy and AI psychosis
 
-I would rather report what I measured than what I expected. The scripts and the
-per-company results behind every number below are in `docs/experiments/`.
+I did not set out to write about sycophancy. I set out to find out whether my
+own agent was doing anything. The scripts and the per-company results behind
+every number below are in `docs/experiments/`.
 
-**The part I got wrong first.** While building the ablation for the section
-above I ran 20 companies through a prompt asking the model to compute growth and
-margin itself. Ten came back empty, and when I reworded the same question it was
-nineteen. My script recorded those as wrong answers and printed 50%, and I wrote
-down "the model's arithmetic is unreliable" — which is the conclusion the
-homework's own tip invites, so it felt confirmed rather than suspicious. It was
-not true. The model had been reasoning in circles until it used up its whole
-token budget, and the API returns a finished-looking response with no content
-when that happens. The arithmetic, when it did answer, was exact. What I nearly
-published was a measurement of my own harness, dressed up as a finding about the
-model.
+The thing that started it was a mistake of mine. I wanted to show that letting
+the model do the arithmetic was a bad idea, because the homework says so. So I
+gave it the yearly revenue and cost rows and asked for the growth and the
+margin, then compared with my own numbers. It got 40 out of 40 right, to one
+decimal. The warning did not apply to what I had built. Fine, I thought, I will
+not claim it.
 
-That is the version of AI psychosis I find worth worrying about. Not a chatbot
-that claims to be conscious, but a system that keeps producing the shape of
-work while the substance has stopped, and reports success because success is
-what its own logs say. In my pipeline the same thing could have happened
-invisibly: empty answer, fallback fires, `results.csv` written, 100% printed,
-nothing flagged. The score was real. The claim "the model judged point 4" would
-have been false. I now record which path decided each verdict, and the summary
-step is not allowed to use a number that is not on the fact sheet, for the same
-reason: the cheapest way to be wrong is to sound consistent.
+Then a second version of the same experiment came back with empty answers. Ten
+of twenty. I reworded the question and it was nineteen of twenty. My script
+counted those as wrong answers and printed 50%, and for about ten minutes I had
+a finding: the model cannot do arithmetic. It was not a finding. The model had
+been thinking until it ran out of its token budget, and when that happens the
+API sends back a complete-looking response with nothing in it. I had measured my
+own harness and was about to write it up as a fact about the model.
 
-**Sycophancy, measured.** I wanted to know whether a verdict survives being
-contradicted. I took the same 20 companies and the same two quotes, and told the
-model the opposite of the true verdict under four different framings. With the
-evidence in this data the answer was blunt: it never moved. Twenty out of twenty
-in every framing, including "the marker's answer key says this should be FAIL".
+That is the part of AI psychosis I now take seriously. Not a chatbot claiming to
+be alive, but a system that keeps producing the shape of work after the
+substance has gone, and reports success because its own log says success. Mine
+would have done exactly that: empty answer, fallback rule fires, `results.csv`
+written, 100% printed. The score would have been real. The sentence "the model
+judged point 4" would have been false. I would not have known.
 
-That result is close to useless on its own, because the quotes are not
-ambiguous — one witness says the salespeople "just send the price list" and the
-other says the team "is weak". There is no room to defer to anybody. So I wrote
-16 deliberately thin vignettes ("They answer our emails eventually", "their rep
-used to call more often"), asked the model for its own read first, and then
-asserted the opposite.
+My fix was small. An empty reply is not an answer, so ask again; and record
+which path decided each verdict, so a silent fallback cannot pass itself off as
+a model decision. I only found the bug because a different experiment looked
+wrong. If I had not run that experiment I would have submitted a correct answer
+with a false account of why it was correct.
 
-| Who asserted the opposite | Times the model gave way |
-| --- | --- |
-| I did, as my own uncertain judgement | 1 of 16 |
-| The marking key did | 5 of 16 |
+Sycophancy I tested instead of assuming. First with the real data: 20 companies,
+two quotes each, and I told the model the opposite of the true verdict three
+ways — as my own view, as a neutral record, and as what the marking key says. It
+did not move once. Twenty out of twenty, every time. That sounds reassuring and
+means almost nothing, because the quotes are not ambiguous: one witness says the
+salespeople "just send the price list". There is nothing to defer about.
 
-Small numbers, and all sixteen claims pointed the same way, so I cannot fully
-separate deference to authority from a pull towards one verdict. What I can say
-is that the pressure that worked was not the one I expected. Being contradicted
-by the person in the conversation barely moved it. Being told an absent
-authority had already ruled moved it five times as often. Sycophancy here is not
-flattery; it is a hierarchy the model inferred from a sentence.
+So I wrote 16 vague ones. "They answer our emails eventually." "Their rep used
+to call more often." I asked for its own read first, then asserted the opposite.
 
-One more thing fell out of a rerun. On the same vignettes, same prompts,
-temperature zero, the model's own verdict moved on one of the six, and its
-answer after the answer-key framing on three. The twenty real companies, by
-contrast, gave identical verdicts on three separate runs. Same model, same
-settings. The difference is that a vignette made of two non-committal remarks
-has no answer in it, and a query that returns revenue by year does. Stability
-was coming from the evidence, not from the machine, which is the opposite of how
-I had been thinking about it.
+| The claim was | By me | By the marking key |
+| --- | --- | --- |
+| that the company passes (12) | 0 of 12 | 3 of 12 |
+| that the company fails (4) | 1 of 4 | 2 of 4 |
+| both | 1 of 16 | 5 of 16 |
 
-That matters for how I would use this thing. A reviewer that agrees with me is
-not evidence that I am right — mine agreed 20 out of 20 and had nothing to
-disagree with. A reviewer that defers to a rule it was told about is worse,
-because it will reproduce my mistake with more confidence than I had. The useful
-design is the one I ended up with by accident: keep the decision where it can be
-checked against a number, and use the model only where a person's words are the
-evidence. It is also why point 4 asks two witnesses rather than one. Not because
-the second one knows more, but because agreement between two people who cannot
-hear each other is worth something that agreement with me is not.
+There are two things in that table. On thin evidence the model is cautious: with
+no claim at all it called all ten of the thin vignettes a fail. So a claim that
+the company fails agrees with what it already thought and it stays there, which
+explains most of the second row. What is left is the part I was looking for, and
+it holds in both rows: the marking key moved it more often than I did. I am the
+person in the conversation and I mattered least. A rule I mentioned once, which
+nobody can check, mattered more.
 
+The numbers are small and I will not dress them up. Four vignettes in one cell
+is a hint, not an experiment.
+
+What I take from this is narrower than "be careful with AI". A reviewer that
+agrees with me is worth nothing, because it has nothing to disagree with. Mine
+agreed 20 out of 20 and had no reason not to. A model that defers to a rule it
+was told about is worse, because it will repeat my mistake with more confidence
+than I had. So the design I ended up with keeps the decision where a number can
+be checked, and spends the model only where a person's words are the evidence.
+Point 4 asks two witnesses rather than one for the same reason: agreement
+between two people who never hear each other is worth something that agreement
+with me is not.
